@@ -1,3 +1,4 @@
+import argparse
 import collections 
 import math
 import os
@@ -195,23 +196,65 @@ class LanguageModelTrainer:
             data_dir,
             device,
             max_epochs=10,
-            batch_size = 32,
+            batch_size=32,
             log_interval=200,
             sequence_length=250,
-            clip=0.25):
+            clip=0.25,
+            scheduled_sampling=False):
 
         self.model = model
         self.optimizer = optimizer
         self.model.to(device)
         self.device = device
+        self.step = 0
+        self.epoch = 0
 
         self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.log_interval = log_interval
         self.clip = clip
         self.sequence_length = sequence_length
+        self.scheduled_sampling = scheduled_sampling
 
         self.dataset = Dataset(data_dir)
+
+    def forward(self, inputs, state):
+        self.step += 1
+
+        if self.scheduled_sampling:
+            bsz = inputs.size(0)
+            sequence_length = inputs.size(1)
+            x = []
+            x_t = None
+            h = None
+            c = None
+            for t in range(sequence_length):
+                if t > 0:
+
+#                     p = inputs.new_full(
+#                         (bsz, 1),
+#                         1 / (1 + math.exp(self.step / 1)))
+                    threshold = 1 / (1 + math.exp((self.epoch + 1) / 1))
+                    coin = torch.randn(bsz, 1, device=inputs.device)
+
+                    inputs_t = torch.where(
+                        threshold < coin,
+                        x_t.argmax(dim=-1),
+                        inputs[:, t].unsqueeze(1))
+
+                    inputs_t = x_t.argmax(dim=-1)
+                else:
+                    inputs_t = inputs[:, t].unsqueeze(1)
+
+                x_t, (h_t, c_t) = self.model.forward(inputs[:, t].unsqueeze(1), state)
+                x.append(x_t)
+                state = (h_t, c_t)
+                h = h_t
+                c = c_t
+            x = torch.cat(x, dim=1)
+        else:
+            x, (h, c) = self.model.forward(inputs, state)
+        return x, (h, c)
 
     def train(self):
         print('Run trainer')
@@ -226,6 +269,7 @@ class LanguageModelTrainer:
         start_at = time.time()
 
         for epoch in range(self.max_epochs):
+            self.epoch = epoch
             loss_epoch = 0.
             num_token = 0
             step = 0
@@ -234,8 +278,10 @@ class LanguageModelTrainer:
                 num_batch = data.size(0) // self.batch_size
                 data = data.narrow(0, 0, num_batch * self.batch_size)
                 batch = data.view(self.batch_size, -1)
+                batch = batch[:, :10000]
 
                 state = None
+                print('Num batch:', batch.size(1) // self.sequence_length)
                 for seen_batch, i in enumerate(range(0, batch.size(1), self.sequence_length), start=1):
                     e = min(i + self.sequence_length, batch.size(1))
                     batch_i = batch[:, i: e]
@@ -245,7 +291,7 @@ class LanguageModelTrainer:
                     input_i = batch_i[:, :-1]
                     target_i = batch_i[:, 1:]
 
-                    x, (h, c) = self.model(input_i, state)
+                    x, (h, c) = self.forward(input_i, state)
 
                     vocab_size = x.size(2)
                     num_token_i = (target_i != pad).sum().item()
@@ -271,9 +317,13 @@ class LanguageModelTrainer:
 
                     if step % self.log_interval == 0:
                         elapsed = time.time() - start_at
+                        avg_loss = loss_epoch / num_token
+                        ppl = math.exp(avg_loss)
                         print(f'epoch:{epoch} step:{step}'
-                              f' loss:{loss_epoch/num_token:.2f}'
-                              f' elapsed:{elapsed:.2f}')
+                              f' loss:{avg_loss:.2f}'
+                              f' ppl:{ppl:.2f}'
+                              f' elapsed:{elapsed:.2f}',
+                              flush=True)
 
             loss_epoch /= num_token
             ppl = math.exp(loss_epoch)
@@ -292,7 +342,9 @@ def run_trainer(
         batch_size=128,
         bin_dir='data-bin',
         device='cuda:0',
-        force_preprocess=False):
+        force_preprocess=False,
+        log_interval=200,
+        scheduled_sampling=False):
 
     preprocessor = Preprocessor(
         train_file,
@@ -312,9 +364,34 @@ def run_trainer(
         bin_dir,
         device,
         max_epochs=max_epochs,
-        batch_size=batch_size)
+        batch_size=batch_size,
+        log_interval=log_interval,
+        scheduled_sampling=scheduled_sampling)
     trainer.train()
 
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch-size', type=int, default=20)
+    parser.add_argument('--device', default='cpu')
+    parser.add_argument('--do-train', action='store_true', default=True)
+    parser.add_argument('--do-eval', action='store_true', default=False)
+    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--with-scheduled-sampling', default=False, action='store_true')
+
+    args = parser.parse_args()
+
+    if args.do_train:
+        run_trainer(
+            '/Users/takuya/data/ja.text8',
+            device=args.device,
+            batch_size=args.batch_size,
+            log_interval=args.log_interval,
+            scheduled_sampling=args.with_scheduled_sampling,
+        )
+    elif args.do_eval:
+        pass
+
+
 if __name__ == '__main__':
-    run_trainer('sample', device='cpu', batch_size=2)
+    main()
